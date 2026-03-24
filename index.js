@@ -8,118 +8,100 @@ app.use(cors());
 const SCRAPER_KEY = process.env.SCRAPER_API_KEY || '81c9a23e3daeb02e8140b6aa5783f916';
 const PAGE_URL    = 'https://in.investing.com/indices/gift-nifty-50-c1-futures';
 
-async function fetchPage(url, render = false) {
+async function fetchPage(url, render) {
   const proxy = `http://api.scraperapi.com?api_key=${SCRAPER_KEY}&url=${encodeURIComponent(url)}${render ? '&render=true' : ''}`;
   const res   = await fetch(proxy);
   return res.text();
 }
 
-// Extract number from string like "23,150.50" or "23150.50"
 function extractNumber(str) {
   if (!str) return null;
-  const clean = str.replace(/,/g, '');
-  const num   = parseFloat(clean);
+  const num = parseFloat(str.replace(/,/g, ''));
   return isNaN(num) ? null : num;
 }
 
-// Parse price data from investing.com HTML
-function parsePrice(html) {
-  const result = {};
-
-  // Try multiple patterns investing.com uses to embed price data
-
-  // 1. JSON-LD structured data
-  const jsonLdMatch = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/);
-  if (jsonLdMatch) {
-    try {
-      const jsonLd = JSON.parse(jsonLdMatch[1]);
-      if (jsonLd.price) result.price = extractNumber(jsonLd.price);
-    } catch(e) {}
-  }
-
-  // 2. Meta tags
-  const metaPrice = html.match(/property="price"[^>]*content="([^"]+)"/);
-  if (metaPrice) result.price = result.price || extractNumber(metaPrice[1]);
-
-  // 3. data-last-value attribute (common in investing.com)
-  const dataLast = html.match(/data-last-value="([0-9,\.]+)"/);
-  if (dataLast) result.price = result.price || extractNumber(dataLast[1]);
-
-  // 4. Inline JS variables
-  const jsLast = html.match(/"last(?:Price|Numeric|Value)"?\s*:\s*"?([0-9,\.]+)"?/);
-  if (jsLast) result.price = result.price || extractNumber(jsLast[1]);
-
-  // 5. Look for the price in common HTML patterns
-  const priceSpan = html.match(/class="[^"]*(?:last-price|instrument-price|text-2xl)[^"]*"[^>]*>([0-9,\.]+)</);
-  if (priceSpan) result.price = result.price || extractNumber(priceSpan[1]);
-
-  // Extract change
-  const changeMatch = html.match(/"(?:change|netChange)"\s*:\s*"?([-0-9,\.]+)"?/);
-  if (changeMatch) result.change = extractNumber(changeMatch[1]);
-
-  const changePctMatch = html.match(/"(?:changePercent|pChange|percentChange)"\s*:\s*"?([-0-9,\.]+)"?/);
-  if (changePctMatch) result.changePct = extractNumber(changePctMatch[1]);
-
-  return result;
-}
-
 app.get('/', (req, res) => {
-  res.json({ status: 'Gift Nifty proxy running ✓', source: 'investing.com page scrape' });
+  res.json({ status: 'Gift Nifty proxy running ✓' });
 });
 
-// ── /raw — see raw HTML snippet for debugging ─────────────────
+// ── /raw — debug HTML patterns ────────────────────────────────
 app.get('/raw', async (req, res) => {
   try {
     const html = await fetchPage(PAGE_URL, false);
-    // Return a sample of the HTML around price-related content
-    const priceIdx = html.search(/data-last|last-price|lastNumeric|lastPrice/i);
+
+    const nextDataIdx  = html.indexOf('__NEXT_DATA__');
+    const lastNumeric  = html.indexOf('lastNumeric');
+    const dataLast     = html.indexOf('data-last');
+    const prevClose    = html.indexOf('prevClose');
+
+    // Find any number in Gift Nifty price range 20000-29999
+    const priceMatch = html.match(/\b(2[0-9]\d{3}\.\d{2})\b/);
+
+    // Get next data snippet
+    let nextSnippet = 'not found';
+    if (nextDataIdx > 0) {
+      nextSnippet = html.substring(nextDataIdx, nextDataIdx + 300);
+    }
+
+    // Get lastNumeric snippet
+    let lastNumericSnippet = 'not found';
+    if (lastNumeric > 0) {
+      lastNumericSnippet = html.substring(Math.max(0, lastNumeric - 50), lastNumeric + 100);
+    }
+
     res.json({
-      htmlLength:   html.length,
-      priceIdx,
-      snippet:      priceIdx > 0 ? html.substring(Math.max(0, priceIdx-100), priceIdx+200) : 'not found',
-      metaSnippet:  html.match(/og:title[^>]+content="([^"]+)"/)? html.match(/og:title[^>]+content="([^"]+)"/) [1] : '',
+      htmlLength:          html.length,
+      nextDataIdx,
+      lastNumericIdx:      lastNumeric,
+      dataLastIdx:         dataLast,
+      prevCloseIdx:        prevClose,
+      firstPriceInRange:   priceMatch ? priceMatch[1] : 'not found',
+      nextDataSnippet:     nextSnippet,
+      lastNumericSnippet,
     });
   } catch(e) {
     res.json({ error: e.message });
   }
 });
 
-// ── /quote — live Gift Nifty price ───────────────────────────
+// ── /quote — extract price from page ─────────────────────────
 app.get('/quote', async (req, res) => {
   try {
-    const html   = await fetchPage(PAGE_URL, false);
-    const parsed = parsePrice(html);
+    const html = await fetchPage(PAGE_URL, false);
 
-    if (!parsed.price) {
-      // Try with JS rendering if static scrape didn't find price
-      const html2   = await fetchPage(PAGE_URL, true);
-      const parsed2 = parsePrice(html2);
+    // Try to extract from __NEXT_DATA__ JSON blob
+    const nextDataMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+    if (nextDataMatch) {
+      try {
+        const data  = JSON.parse(nextDataMatch[1]);
+        const props = JSON.stringify(data);
+        const price = props.match(/"(?:last|lastNumeric|currentPrice|price)"\s*:\s*([\d.]+)/);
+        const change= props.match(/"(?:change|netChange)"\s*:\s*(-?[\d.]+)/);
+        const pct   = props.match(/"(?:changePercent|pChange)"\s*:\s*(-?[\d.]+)/);
 
-      if (!parsed2.price) {
-        return res.status(500).json({
-          ok: false,
-          error: 'Could not extract price from page',
-          htmlLength: html.length,
-          html2Length: html2.length,
-        });
-      }
+        if (price) {
+          return res.json({
+            ok:        true,
+            price:     parseFloat(price[1]),
+            change:    change ? parseFloat(change[1]) : null,
+            changePct: pct    ? parseFloat(pct[1])    : null,
+            source:    'investing.com __NEXT_DATA__',
+          });
+        }
+      } catch(e) {}
+    }
 
+    // Fallback: find first number in Gift Nifty price range
+    const priceMatch = html.match(/\b(2[0-9]\d{3}\.\d{2})\b/);
+    if (priceMatch) {
       return res.json({
-        ok:       true,
-        price:    parsed2.price,
-        change:   parsed2.change,
-        changePct:parsed2.changePct,
-        source:   'investing.com (rendered)',
+        ok:     true,
+        price:  parseFloat(priceMatch[1]),
+        source: 'investing.com page (regex)',
       });
     }
 
-    res.json({
-      ok:        true,
-      price:     parsed.price,
-      change:    parsed.change,
-      changePct: parsed.changePct,
-      source:    'investing.com',
-    });
+    res.status(500).json({ ok: false, error: 'Price not found in page', htmlLength: html.length });
 
   } catch(e) {
     res.status(500).json({ ok: false, error: e.message });
