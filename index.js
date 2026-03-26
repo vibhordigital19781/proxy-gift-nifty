@@ -10,7 +10,7 @@ const GN_URL       = 'https://in.investing.com/indices/gift-nifty-50-c1-futures'
 const GBN_URL      = 'https://in.investing.com/indices/gift-nifty-bank-c1-futures';
 
 async function fetchPage(url) {
-  const proxy = `http://api.scraperapi.com?api_key=${SCRAPER_KEY}&url=${encodeURIComponent(url)}`;
+  const proxy = `https://api.scrape.do?token=${SCRAPER_KEY}&url=${encodeURIComponent(url)}`;
   const res   = await fetch(proxy);
   return res.text();
 }
